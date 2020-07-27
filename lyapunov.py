@@ -6,16 +6,10 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 import pickle as pkl
 import gc
+import math
 
-
-# This code was written by Ryan Vogt, PhD student in the Department of Applied Matematics, University of Washington
-# Contact: ravogt95@uw.edu
-# The purpose of this code is to calculate the Lyapunov spectra of recurrent neural networks.
 
 def calc_Jac(*params, model):
-    #Use the built-in torch method for calcuating gradients. This is a very slow process that does not translate well to calcuating spectra
-    #In order to get MUCH better results, calculate the derivatives analytically and create a method for the given network type
-    #In this module, the derivatives for LSTM, GRU, and vanilla RNN have been calculated. See below.
     cells = len(params) > 2
     if cells:
         inputs= params[0]
@@ -66,95 +60,140 @@ def oneStepVarQR(J, Q):
     return torch.matmul(q, s), torch.diagonal(torch.matmul(s, r), dim1 = 1, dim2 = 2) #return positive r values and corresponding vectors
 
 
-# Primary method:
-def calc_LEs_an(*params, model, rec_layer, k_LE=100000, numerical = False, eps= .001):
-    # Method that calculates the Lyapunov spectrum of a the network 'model'.
-    # Inputs:   params - Tuple of length either 2 or 3. First entry is always x_in, which is the external input into the system. Dimensions = (batch size, #trials, input size)
-    #                                                   Second entry is always the hidden state, h. First dimension must match first dimension of x_in
-    #                                                   Third entry (if there is one) is the cell state (only if it is an LSTM)
-    #           model - (Pytorch model) Single recurrent layer in the same form as the standard Pytorch LSTM, GRU, RNN. Needs to have its weight/bias
-    #                   stored in a list of legnth (# of layers) all_weights, where each layer contains the weight matrices/vectors W, U, (b_x, b_h)
-    #           rec_layer - (Lower-case string) Type of recurrent layer used. Currently, supported inputs are: 'rnn', 'gru', 'lstm'. If any other input is given,
-    #                                           the built-in pytorch method of calculating the Jacobian will be used, which is much slower.
-    #           k_LE - (Integer) Number of Lyapunov exponents to track. Best to keep all since it is unclear how this propagates. Leave this argument blank.
-    #           numerical - (Boolean) If you would like to use the numerical calculation of the Jacobian. NOT recommended. Analytical is much faster and more tested
-    #           eps = Only used if numerical is True. This is the step-size to use in the finite difference method
-    # Outputs:  LEs - (Pytorch Tensor-2D) The lyapunov spectra. The dimensions will be (batch size, hidden_size OR k_LE)
-    #           rvals - (Pytorch Tensor-3D) The values of the diagonal of the diagonal elements of the R matrix used in the Gram-Schmitt
-    #                   decomposition at each time step. Dimensions = (batch size, #time steps, hidden_size OR k_LE)
-    cuda = next(model.parameters()).is_cuda
-    if cuda:
-        device = torch.device('cuda')
+def calc_LEs_an(*params, model, k_LE=100000, rec_layer= 0, kappa = 10, diff= 10, warmup = 10, T_ons = 1):
+	cuda = next(model.parameters()).is_cuda
+	if cuda:
+		device = torch.device('cuda')
+	else:
+		device = torch.device('cpu')
+	bias = model.rnn_layer.bias
+	cells = False #determine whether to track cell states (for LSTM)
+	x_in = Variable(params[0], requires_grad = False).to(device)
+	hc = params[1]
+	if len(hc) == 2:
+		cells = True
+		c0 = hc[1].to(device)
+		h0 = Variable(hc[0], requires_grad = False).to(device)
+	else:
+		h0 = Variable(hc, requires_grad = False).to(device)
+	num_layers, batch_size, hidden_size = h0.shape
+	_, feed_seq, input_size = x_in.shape
+	L = num_layers*hidden_size
+		
+	k_LE = max(min(L, k_LE), 1)
+	Q = torch.reshape(torch.eye(L), (1, L, L)).repeat(batch_size, 1, 1).to(device)
+	Q = Q[:, :, :k_LE] #Choose how many exponents to track
+
+	ht = h0
+	if cells:
+		ct = c0
+		states = (ht, ct)
+	else:
+		states = (ht, ) #make tuple for easier generalization
+	rvals = torch.ones(batch_size, feed_seq, k_LE).to(device) #storage
+	#qvect = torch.zeros(batch_size, feed_seq, L, k_LE) #storage
+	t = 0
+
+	#Warmup
+	for xt in tqdm(x_in.transpose(0,1)[:warmup]):
+		xt = torch.unsqueeze(xt, 1) #select t-th element in the fed sequence
+		if cells:
+			states = (ht, ct)
+		else:
+			states = (ht, )
+		
+		if rec_layer=='rnn':
+			J = rnn_jac(model.rnn_layer.all_weights, ht, xt, bias = bias)
+		elif rec_layer=='lstm':
+			J = lstm_jac(model.rnn_layer.all_weights, ht, ct, xt, bias = bias)
+		elif rec_layer=='gru':
+			J = gru_jac(model.rnn_layer.all_weights, ht, xt, bias = bias)
+		else:
+			J = calc_Jac(xt, *states, model=model)
+		_, states = oneStep(xt, *states, model=model)
+		if cells:
+			(ht, ct) = states
+		else:
+			ht = states
+		Q = torch.matmul(torch.transpose(J, 1, 2), Q)
+	Q, _ = torch.qr(Q, some = True)
+	#     print(Q.shape)
+
+	T_pred = math.log2(kappa/diff)
+	#     T_ons = max(1, math.floor(T_pred))
+	#     print('Pred = {}, QR Interval: {}'.format(T_pred, T_ons))
+	#     print(ht[0])
+
+	t_QR = t
+	for xt in tqdm(x_in.transpose(0,1)):
+		if (t - t_QR) >= T_ons or t==0 or t == feed_seq:
+			QR = True
+		else: 
+			QR = False
+		xt = torch.unsqueeze(xt, 1) #select t-th element in the fed sequence
+		if cells:
+			states = (ht, ct)
+		else:
+			states = (ht, )
+		
+		if rec_layer=='rnn':
+			J = rnn_jac(model.rnn_layer.all_weights, ht, xt, bias = bias)
+		elif rec_layer=='lstm':
+			J = lstm_jac(model.rnn_layer.all_weights, ht, ct, xt, bias = bias)
+		elif rec_layer=='gru':
+			J = gru_jac(model.rnn_layer.all_weights, ht, xt, bias = bias)
+		else:
+			J = calc_Jac(xt, *states, model=model)
+		
+		_, states = oneStep(xt, *states, model=model)
+		if QR:
+			Q, r = oneStepVarQR(J, Q)
+			t_QR = t
+			
+		else:
+			Q = torch.matmul(torch.transpose(J, 1, 2), Q)
+			r = torch.ones((batch_size, hidden_size))
+		if cells:
+			ht, ct = states
+		else: ht = states
+		rvals[:, t, :] = r
+		#qvect[:, t, :, :] = Q
+
+		t = t+1
+	LEs = torch.sum(torch.log2(rvals.detach()), dim = 1)/feed_seq
+	#     print(torch.log2(rvals.detach()).shape)
+	return LEs, rvals#, qvect
+
+def plot_evolution(rvals, k_LE, model_name = '', sample_id = 0, title = False, plot_size = (10, 7)):
+    plt.figure(figsize = plot_size)
+    feed_seq = rvals.shape[1]
+    if type(k_LE == int):
+        for i in range(k_LE):
+            f = plt.plot(torch.div(torch.cumsum(torch.log2(rvals[sample_id,:,i]), dim = 0),torch.arange(1., feed_seq+1)))
     else:
-        device = torch.device('cpu')
-    bias = model.rnn_layer.bias
-    cells = False #determine whether to track cell states (for LSTM)
-    x_in = Variable(params[0], requires_grad = False).to(device)
-    hc = params[1]
-    if len(hc) == 2:
-        cells = True
-        c0 = hc[1].to(device)
-        h0 = Variable(hc[0], requires_grad = True).to(device)
-    else:
-        h0 = Variable(hc, requires_grad = True).to(device)
-    num_layers, batch_size, hidden_size = h0.shape
-    _, feed_seq, input_size = x_in.shape
-    L = num_layers*hidden_size
-        
-    k_LE = max(min(L, k_LE), 1)
-    Q = torch.reshape(torch.eye(L), (1, L, L)).repeat(batch_size, 1, 1).to(device)
-    Q = Q[:, :, :k_LE] #Choose how many exponents to track
+        f = plt.plot(torch.div(torch.cumsum(torch.log2(rvals[sample_id,:,i]), dim = 0),torch.arange(1., feed_seq+1)))
+    f = plt.xlabel('Iteration #')
+    f = plt.ylabel('Lyapunov Exponent')
+    if title:
+        plt.title('LE Spectrum Evolution for '+model_name+', Sample #'+ str(sample_id))
+    return f
 
-    ht = h0
-    if cells:
-        ct = c0
-        states = (ht, ct)
-    else:
-        states = (ht, ) #make tuple for easier generalization
-    rvals = torch.zeros(batch_size, feed_seq, k_LE).to(device) #storage
-    #qvect = torch.zeros(batch_size, feed_seq, L, k_LE) #storage
-    t = 0
+def LE_stats(LE, save_file = False, file_name = 'LE.p'):
+	mean, std = (torch.mean(LE, dim=0), torch.std(LE, dim=0))
+	if save_file:
+		pkl.dump((mean, std), open(file_name, "wb"))
+	return mean, std
 
-    for xt in tqdm(x_in.transpose(0,1)):
-        xt = torch.unsqueeze(xt, 1) #select t-th element in the fed sequence
-        ht = Variable(ht, requires_grad = True).to(device) #ensure that ht is a differentiable variable
-        if cells:
-            states = (ht, ct)
-        else:
-            states = (ht, )
-        
-        #Determine how to calculate the Jacobian of the network (numerical, pytorch, or analytical)
-        if numerical:
-            J = num_Jac(xt, *states, model=model, eps = eps)
-        else:
-            if rec_layer=='rnn':
-                J = rnn_jac(model.rnn_layer.all_weights, ht, xt, bias = bias)
-            elif rec_layer=='lstm':
-                J = lstm_jac(model.rnn_layer.all_weights, ht, ct, xt, bias = bias)
-            elif rec_layer=='gru':
-                J = gru_jac(model.rnn_layer.all_weights, ht, xt, bias = bias)
-            else:
-                J = calc_Jac(xt, *states, model=model)
-                
-        Q, r = oneStepVarQR(J, Q)
-        del J
-        _, states = oneStep(xt, *states, model=model)
-        if cells:
-            ht, ct = states
-        else: ht = states
-        rvals[:, t, :] = r
-        #qvect[:, t, :, :] = Q
-        del r, xt
-        t = t+1
-    LEs = torch.sum(torch.log2(rvals.detach()), dim = 1)/feed_seq
+def plot_spectrum(LE, model_name, k_LE = 100000, plot_size = (10, 7), legend = []):
+	k_LE = max(min(LE.shape[1], k_LE), 1)
+	LE_mean, LE_std = LE_stats(LE)
+	f = plt.figure(figsize = plot_size)
+	x = range(1, k_LE+1)
+	plt.title('Mean LE Spectrum for '+model_name)
+	f = plt.errorbar(x, LE_mean[:k_LE].to(torch.device('cpu')), yerr=LE_std[:k_LE].to(torch.device('cpu')), marker = '.', linestyle = ' ', markersize = 7, elinewidth = 2)
+	plt.xlabel('Exponent #')
 
-    return LEs, rvals#, qvect
-
-## Methods for Calcuating Jacobians:
-
-def num_Jac(xt, *states, model, eps= 0.01):
-    #Numerical Jacobian calculation (computationally ineffiecient and slow at the moment, especially in LE calculation)
-    #Also, the flattening seems to mess up the indices so I don't believe the calculation is even correct
+def num_Jac(xt, *states, model, eps= 0.01):    
 	if len(states)> 1:
 		h, c = states
 	else:
@@ -178,12 +217,8 @@ def num_Jac(xt, *states, model, eps= 0.01):
 	del fwd, bwd, hf, hb, fstates, bstates
 	gc.collect()
 	return Jac
-    
-## Analytical methods
+
 def lstm_jac(params_array, h, c, x, bias):
-    # Calculate the Jacobian of an LSTM layer with the parameters given in params_array
-    # The expected format of params_array is that given by PyTorch when all_weights is called.
-    # The output will be the Jacobian matrix with respect to the hidden states, h
     if bias:
         W, U, b_i, b_h = param_split(params_array, bias)
     else:
@@ -193,11 +228,14 @@ def lstm_jac(params_array, h, c, x, bias):
     input_shape = x.shape[-1]
     h_in = h.transpose(1,2).detach()
     c_in = c.transpose(1,2).detach()
+#     print(c_in)
     c_out = []
     x_in = [x.squeeze(dim=1).t()]
     if bias:
         b = [b1 + b2 for (b1,b2) in zip(b_i, b_h)]
     else:
+#         for W_i in W:
+#             print(W_i.shape)
         b = [torch.zeros(W_i.shape[0],).to(device) for W_i in W]
     y_ones = torch.ones(hidden_size*4, batch_size)
     y = []
@@ -240,13 +278,14 @@ def lstm_jac(params_array, h, c, x, bias):
             J_xt = c_xt@a_xt+b_xt
             for l in range(layer, 0, -1):
                 J[:, layer*hidden_size:(layer+1)*hidden_size, (l-1)*hidden_size:l*hidden_size] = J_xt@J[:, (layer-1)*hidden_size:(layer)*hidden_size, (l-1)*hidden_size:l*hidden_size]
+
+#     print('h_out = ' + str(h_out))
+#     print('c_out = ' + str(c_out))
+    
     return J
 
 
 def gru_jac(params_array, h, x, bias):
-    # Calculate the Jacobian of an GRU layer with the parameters given in params_array
-    # The expected format of params_array is that given by PyTorch when all_weights is called.
-    # The output will be the Jacobian matrix with respect to the hidden states, h
     if bias:
         W, U, b_i, b_h = param_split(params_array, bias)
     else:
@@ -303,9 +342,6 @@ def gru_jac(params_array, h, x, bias):
     return J
     
 def rnn_jac(params_array, h, x, bias):
-    # Calculate the Jacobian of an RNN layer with the parameters given in params_array
-    # The expected format of params_array is that given by PyTorch when all_weights is called.
-    # The output will be the Jacobian matrix with respect to the hidden states, h
     if bias:
         W, U, b_i, b_h = param_split(params_array, bias)
     else:
@@ -314,7 +350,7 @@ def rnn_jac(params_array, h, x, bias):
     num_layers, batch_size, hidden_size = h.shape
     input_shape = x.shape[-1]
     h_in = h.transpose(1,2).detach()
-    x_in = [x.squeeze(dim=1).t()]
+    x_in = [x.squeeze(dim=1).t()]#input_shape, batch_size)]
     if bias:
         b = [b1 + b2 for (b1,b2) in zip(b_i, b_h)]
     else:
@@ -338,11 +374,10 @@ def rnn_jac(params_array, h, x, bias):
                 J[:, layer*hidden_size:(layer+1)*hidden_size, (l-1)*hidden_size:l*hidden_size] = J_xt@J[:, (layer-1)*hidden_size:(layer)*hidden_size, (l-1)*hidden_size:l*hidden_size]
     return J
         
-# Helper Functions
+    
     
 def param_split(model_params, bias):
-#   model_params should be tuple of the form (W_i, W_h, b_i, b_h) - if bias = True
-#                                            (W_i, W_h) - if bias = False 
+#   model_params should be tuple of the form (W_i, W_h, b_i, b_h)
     hidden_size =int(model_params[0][0].shape[0])
     layers = len(model_params)
     W = []
@@ -385,29 +420,3 @@ def sech(X):
 def tanh(X):
     device = get_device(X)
     return torch.diag_embed(torch.tanh(X))
-
-## Post-processing of spectra
-def plot_evolution(rvals, k_LE, model_name, sample_id = 0, plot_size = (10, 7)):
-	plt.figure(figsize = plot_size)
-	feed_seq = rvals.shape[1]
-	for i in range(k_LE):
-		f = plt.plot(torch.div(torch.cumsum(torch.log2(rvals[sample_id,:,i]), dim = 0),torch.arange(1., feed_seq+1)))
-	f = plt.xlabel('iteration #')
-	f = plt.ylabel('LE')
-	plt.title('LE Spectrum Evolution for '+model_name+', Sample #'+ str(sample_id))
-	return f
-
-def LE_stats(LE, save_file = False, file_name = 'LE.p'):
-	mean, std = (torch.mean(LE, dim=0), torch.std(LE, dim=0))
-	if save_file:
-		pkl.dump((mean, std), open(file_name, "wb"))
-	return mean, std
-
-def plot_spectrum(LE, model_name, k_LE = 100000, plot_size = (10, 7), legend = []):
-	k_LE = max(min(LE.shape[1], k_LE), 1)
-	LE_mean, LE_std = LE_stats(LE)
-	f = plt.figure(figsize = plot_size)
-	x = range(1, k_LE+1)
-	plt.title('Mean LE Spectrum for '+model_name)
-	f = plt.errorbar(x, LE_mean[:k_LE].to(torch.device('cpu')), yerr=LE_std[:k_LE].to(torch.device('cpu')), marker = '.', linestyle = ' ', markersize = 7, elinewidth = 2)
-	plt.xlabel('Exponent #')
